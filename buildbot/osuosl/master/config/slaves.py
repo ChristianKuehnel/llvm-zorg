@@ -44,6 +44,7 @@ def get_build_slaves():
         create_slave("linaro-aarch64-full", properties={'jobs' : 32}, max_builds=1),
         create_slave("linaro-aarch64-global-isel", properties={'jobs' : 32}, max_builds=1),
         create_slave("linaro-aarch64-lld", properties={'jobs' : 32}, max_builds=1),
+        create_slave("linaro-aarch64-flang-oot", properties={'jobs' : 32}, max_builds=1),
         # Libcxx testsuite has tests with timing assumptions.  Run single-threaded to make
         # sure we have plenty CPU cycle to satisfy timing assumptions.
         create_slave("linaro-aarch64-libcxx", properties={'jobs' : 1}, max_builds=1),
@@ -157,6 +158,9 @@ def get_build_slaves():
 
         # Fedora latest stable x86_64, Intel i5-2500, 4 cores, 12GB RAM
         create_slave("lldb-x86_64-fedora", properties={'jobs': 4}, max_builds=1),
+
+        # Fedora latest stable, arch=x86_64, running on RedHat internal OpenShift PSI cluster
+        create_slave("fedora-llvm-x86_64", properties={'jobs': 64}, max_builds=1),
 
         # Debian x86_64 Buster Xeon(R) Gold 6154 CPU @ 3.00GHz, 192GB RAM
         create_slave("lldb-x86_64-debian", properties={'jobs': 72}, max_builds=1),

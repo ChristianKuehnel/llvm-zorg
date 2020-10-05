@@ -1,6 +1,7 @@
 from buildbot.process.properties import WithProperties
 
 from zorg.buildbot.builders import ClangBuilder
+from zorg.buildbot.builders import FlangBuilder
 from zorg.buildbot.builders import PollyBuilder
 from zorg.buildbot.builders import LLDBBuilder
 from zorg.buildbot.builders import SanitizerBuilder
@@ -530,7 +531,7 @@ def _get_clang_builders():
          'factory' : ClangBuilder.getClangCMakeBuildFactory(clean=False,
                                                             checkout_clang_tools_extra=True,
                                                             checkout_compiler_rt=True,
-                                                            checkout_lld=False,
+                                                            checkout_lld=True,
                                                             checkout_libcxx=False,
                                                             useTwoStage=False,
                                                             runTestSuite=True,
@@ -538,10 +539,11 @@ def _get_clang_builders():
                                                             nt_flags=['--threads=16', '--build-threads=16'],
                                                             extra_cmake_args=["-DLLVM_ENABLE_ASSERTIONS=On", "-DCMAKE_C_COMPILER=clang",
                                                                               "-DCMAKE_CXX_COMPILER=clang++",
+                                                                              "-DCLANG_DEFAULT_LINKER=lld",
                                                                               "-DCMAKE_C_COMPILER_EXTERNAL_TOOLCHAIN:PATH=/opt/rh/devtoolset-7/root/usr",
                                                                               "-DCMAKE_CXX_COMPILER_EXTERNAL_TOOLCHAIN:PATH=/opt/rh/devtoolset-7/root/usr",
                                                                               "-DLLVM_BINUTILS_INCDIR=/usr/include", "-DBUILD_SHARED_LIBS=ON", "-DLLVM_ENABLE_WERROR=ON",
-                                                                              '-DLLVM_LIT_ARGS="-vj 256"']),
+                                                                              "-DLLVM_LIT_ARGS='-vj 64'"]),
          'category' : 'clang'},
 
         {'name': "clang-s390x-linux",
@@ -787,7 +789,6 @@ def _get_clang_builders():
          'builddir' : "clang-x86-ninja-win10",
          'factory' : ClangBuilder.getClangCMakeBuildFactory(
                         clean=True,
-                        checkout_lld=False,
                         vs="autodetect",
                         vs_target_arch='x86',
                         testStage1=True,
@@ -1096,6 +1097,32 @@ def _get_mlir_builders():
                               'CXX': 'clang++',
                               'LD': 'lld',
                         })},
+       # Latest stable fedora running on Red Hat internal OpenShift cluster (PSI)  
+       {'name': 'x86_64-fedora-clang',
+        'mergeRequests': False,
+        'slavenames': ['fedora-llvm-x86_64'],
+        'builddir': 'fedora-llvm-x86_64',
+        'factory': UnifiedTreeBuilder.getCmakeWithNinjaBuildFactory(
+                        clean=True,
+                        depends_on_projects=['llvm', 'clang', 'clang-tools-extra', 'compiler-rt', 'lld', 'mlir'],
+                        checks=['check-all'],
+                        extra_configure_args=[
+                            '-DCMAKE_BUILD_TYPE=Release',
+                            '-DCMAKE_C_COMPILER=/usr/bin/gcc',
+                            '-DCMAKE_CXX_COMPILER=/usr/bin/g++',
+                            '-DLLVM_ENABLE_ASSERTIONS=On',
+                            '-DLLVM_BUILD_EXAMPLES=On',
+                            "-DLLVM_LIT_ARGS='-v --xunit-xml-output test-results.xml'",
+                            '-DLLVM_CCACHE_BUILD=On',
+                            '-DLLVM_CCACHE_DIR=/ccache',
+                            '-DLLVM_CCACHE_MAXSIZE=20G',
+                            '-DLLVM_TARGETS_TO_BUILD=X86',
+                            '-DCMAKE_EXPORT_COMPILE_COMMANDS=1',
+                            '-DLLVM_BUILD_LLVM_DYLIB=On',
+                            '-DLLVM_LINK_LLVM_DYLIB=On',
+                            '-DCLANG_LINK_CLANG_DYLIB=On',
+                            '-DBUILD_SHARED_LIBS=Off',
+                        ])},
     ]
 
 # Sanitizer builders.
@@ -1526,6 +1553,24 @@ def _get_flang_builders():
                         ],
          ),
          'category' : 'flang'},
+
+        {'name': "flang-aarch64-ubuntu-out-of-tree",
+         'slavenames':["linaro-aarch64-flang-oot"],
+         'builddir':"flang-aarch64-out-of-tree",
+         'factory': FlangBuilder.getFlangOutOfTreeBuildFactory(
+             llvm_extra_configure_args=[
+                 "-DLLVM_TARGETS_TO_BUILD=AArch64",
+                 "-DCMAKE_CXX_STANDARD=17",
+                 "-DLLVM_ENABLE_WERROR=OFF",
+                 "-DLLVM_ENABLE_ASSERTIONS=ON",
+                 "-DCMAKE_BUILD_TYPE=Release",
+             ],
+             flang_extra_configure_args=[
+                 "-DFLANG_ENABLE_WERROR=ON",
+                 "-DCMAKE_BUILD_TYPE=Release",
+            ],
+        ),
+        'category' : 'flang'},
 
         {'name': "flang-x86_64-linux",
          'slavenames':["nersc-flang"],
