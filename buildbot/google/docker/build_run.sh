@@ -41,7 +41,7 @@ fi
 # These differ on Windows and Linux
 VOLUMES="-v ${SECRET_STORAGE}:/secrets -v workertest:/test"
 if [ -n "${OS+x}" ] && [[  "${OS}" == "Windows_NT" ]] ; then
-    VOLUMES="-v ${SECRET_STORAGE}:c:\\volumes\\secrets -v workertest:c:\volumes\\test -v workercache:c:\sccache"
+    VOLUMES="-v ${SECRET_STORAGE}:c:\\volumes\\secrets -v workertest:c:\\volumes\\test -v workercache:c:\\volumes\\sccache"
 fi
 
 # Set container arguments, if they are set in the environment:
