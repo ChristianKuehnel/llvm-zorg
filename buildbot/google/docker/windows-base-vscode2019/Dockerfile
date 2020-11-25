@@ -46,14 +46,16 @@ RUN powershell -NoProfile -InputFormat None -Command `
 RUN choco install -y ninja 
 RUN choco install -y git
 RUN choco install -y cmake
-RUN choco install -y gnuwin
-# lit runs best with Python3, Buildbot worker needs Python2
-RUN choco install -y python2 python3
+# installing gnuwin sometimes takes longer than the >45 min default timeout, so
+# extending the timeout manually
+RUN choco install -y --execution-timeout 6000 gnuwin
+RUN choco install -y python3
 RUN choco install -y sccache
-# Install psutils for python3 for lit
+# Install psutils for lit
 RUN pip3 install psutil
-# Install buildbot using python2
-RUN pip2 install --trusted-host pythonhosted.org buildbot-slave==0.8.11 pywin32
+# Install buildbot worker, server was running 2.8.6-dev at time of
+# writing this file
+RUN pip3 install buildbot-worker==2.8.4
 
 # configure Python encoding
 ENV PYTHONIOENCODING=UTF-8
@@ -65,6 +67,8 @@ RUN powershell -NoProfile -InputFormat None  -Command `
 
 # use this folder to store the worksapce'
 WORKDIR C:\buildbot
+# Copy script that fixes issues with slashes in paths
+COPY fix_buildbot_tac_paths.py .
 
 # Root folder for all docker volumes. Make it explicite that all subfolders
 # are volumes. Volumes are a common pitfall for config errors.
