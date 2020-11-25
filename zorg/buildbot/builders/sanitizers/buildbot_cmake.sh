@@ -4,9 +4,6 @@ set -x
 set -e
 set -u
 
-# dump buildbot env
-env
-
 HERE="$(dirname $0)"
 . ${HERE}/buildbot_functions.sh
 
@@ -17,7 +14,13 @@ export PATH="/usr/local/bin:$PATH"
 export ANDROID_SDK_HOME=$ROOT/../../..
 
 # Always clobber bootstrap build trees.
-rm -rf compiler_rt_build llvm_build64 llvm_build_ninja symbolizer_build*
+rm -rf compiler_rt_build llvm_build* symbolizer_build*
+
+USE_CCACHE=
+if ccache -s ; then
+  USE_CCACHE="-DLLVM_CCACHE_BUILD=ON"
+  rm -rf clang_build
+fi
 
 SUPPORTS_32_BITS=${SUPPORTS_32_BITS:-1}
 MAKE_JOBS=${MAX_MAKE_JOBS:-$(nproc)}
@@ -133,7 +136,7 @@ echo @@@BUILD_STEP build fresh toolchain@@@
 if [ ! -d clang_build ]; then
   mkdir clang_build
 fi
-(cd clang_build && cmake -DCMAKE_BUILD_TYPE=RelWithDebInfo ${CMAKE_COMMON_OPTIONS} $LLVM) || echo @@@STEP_FAILURE@@@
+(cd clang_build && cmake -DCMAKE_BUILD_TYPE=RelWithDebInfo ${CMAKE_COMMON_OPTIONS} ${USE_CCACHE} $LLVM ) || (rm -rf clang_build ; echo @@@STEP_FAILURE@@@)
 
 BOOTSTRAP_BUILD_TARGETS="clang"
 if [[ "$CHECK_LLD" != "0" ]]; then

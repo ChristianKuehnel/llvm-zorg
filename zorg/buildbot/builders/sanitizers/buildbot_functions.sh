@@ -1,19 +1,40 @@
 #!/usr/bin/env bash
 
-echo
-echo "How to reproduce locally: https://github.com/google/sanitizers/wiki/SanitizerBotReproduceBuild"
-echo
+echo @@@BUILD_STEP Info@@@
+(
+  set +e
+  env
+  echo
+  uptime
+  echo
+  ulimit -n 100000
+  ulimit -a
+  echo
+  df -h
+  echo
+  ccache -s
+  echo
+  echo "How to reproduce locally: https://github.com/google/sanitizers/wiki/SanitizerBotReproduceBuild"
+  echo
+  exit 0
+)
+echo @@@BUILD_STEP Prepare@@@
 
-uptime
+BUILDBOT_CLOBBER="${BUILDBOT_CLOBBER:-}"
+BUILDBOT_REVISION="${BUILDBOT_REVISION:-origin/master}"
+
+function rm_dirs {
+  while ! rm -rf $@ ; do sleep 1; done
+}
 
 function stage1_clobber {
-  rm -rf llvm_build2_* llvm_build_* libcxx_build_* ${STAGE1_CLOBBER:-}
+  rm_dirs llvm_build2_* llvm_build_* libcxx_build_* ${STAGE1_CLOBBER:-}
 }
 
 function clobber {
   if [ "$BUILDBOT_CLOBBER" != "" ]; then
     echo @@@BUILD_STEP clobber@@@
-    rm -rf svn_checkout llvm llvm-project llvm_build0 ${CLOBBER:-}
+    rm_dirs svn_checkout llvm llvm-project llvm_build0 ${CLOBBER:-}
     stage1_clobber
     ! test "$(ls -A .)" || echo @@@STEP_EXCEPTION@@@
   fi
@@ -37,11 +58,8 @@ function buildbot_update {
       cd llvm-project
       git fetch --depth $DEPTH origin master
       git clean -fd
-      local REV=
-      if [[ "$BUILDBOT_REVISION" == "" ]] ; then
-        REV=origin/master
-      else
-        REV=${BUILDBOT_REVISION}
+      local REV=${BUILDBOT_REVISION}
+      if [[  "$REV" != "origin/master" ]] ; then
         # "git fetch --depth 1 origin $REV" does not work with 2.11 on bots
         while true ; do
           git checkout $REV && break
@@ -69,15 +87,18 @@ function common_stage1_variables {
 }
 
 function build_stage1_clang_impl {
+  rm -rf ${STAGE1_DIR}
   mkdir -p ${STAGE1_DIR}
   local cmake_stage1_options="${CMAKE_COMMON_OPTIONS}"
   cmake_stage1_options="${cmake_stage1_options} -DLLVM_ENABLE_PROJECTS='clang;compiler-rt;lld'"
-  (cd ${STAGE1_DIR} && cmake ${cmake_stage1_options} $LLVM && \
-    ninja clang lld compiler-rt llvm-symbolizer)
+  if ccache -s ; then
+    cmake_stage1_options="${cmake_stage1_options} -DLLVM_CCACHE_BUILD=ON"
+  fi
+  (cd ${STAGE1_DIR} && cmake ${cmake_stage1_options} $LLVM && ninja)
 }
 
 function build_stage1_clang {
-  echo @@@BUILD_STEP build stage1 clang@@@
+  echo @@@BUILD_STEP stage1 build all@@@
   export STAGE1_DIR=llvm_build0
   common_stage1_variables
   build_stage1_clang_impl
@@ -97,7 +118,7 @@ function build_stage1_clang_at_revison {
 
 function common_stage2_variables {
   cmake_stage2_common_options="\
-    ${CMAKE_COMMON_OPTIONS} ${STAGE1_AS_COMPILER}"
+    ${CMAKE_COMMON_OPTIONS} ${STAGE1_AS_COMPILER} -DLLVM_USE_LINKER=lld"
 }
 
 function build_stage2 {
@@ -134,57 +155,42 @@ function build_stage2 {
     exit 1
   fi
 
-  local sanitizer_ldflags=""
-  local sanitizer_cflags=""
-  local cmake_libcxx_flag="-DLLVM_ENABLE_LIBCXX=OFF"
-
   # Don't use libc++/libc++abi in UBSan builds (due to known bugs).
-  if [ "$CHECK_LIBCXX" != "0" -a \
-       "$sanitizer_name" != "ubsan" ]; then
-    echo @@@BUILD_STEP build libcxx/$sanitizer_name@@@
-    mkdir -p ${libcxx_build_dir}
-    local cmake_stage2_libcxx_options="-DLLVM_ENABLE_PROJECTS='libcxx;libcxxabi'"
-    (cd ${libcxx_build_dir} && \
-      cmake \
-        ${cmake_stage2_common_options} \
-        ${cmake_stage2_libcxx_options} \
-        -DCMAKE_BUILD_TYPE=${build_type} \
-        -DLLVM_USE_SANITIZER=${llvm_use_sanitizer} \
-        $LLVM && \
-      ninja cxx cxxabi) || echo $step_result
-    sanitizer_ldflags="$sanitizer_ldflags -lc++abi -Wl,--rpath=${ROOT}/${libcxx_build_dir}/lib -L${ROOT}/${libcxx_build_dir}/lib"
-    sanitizer_cflags="$sanitizer_cflags -nostdinc++ -isystem ${ROOT}/${libcxx_build_dir}/include -isystem ${ROOT}/${libcxx_build_dir}/include/c++/v1"
-    cmake_libcxx_flag="-DLLVM_ENABLE_LIBCXX=ON"
-  fi
+  echo @@@BUILD_STEP stage2/$sanitizer_name build libcxx@@@
+  rm -rf ${libcxx_build_dir}
+  mkdir -p ${libcxx_build_dir}
+  (cd ${libcxx_build_dir} && \
+    cmake \
+      ${cmake_stage2_common_options} \
+      -DLLVM_ENABLE_PROJECTS='libcxx;libcxxabi' \
+      -DCMAKE_BUILD_TYPE=${build_type} \
+      -DLLVM_USE_SANITIZER=${llvm_use_sanitizer} \
+      $LLVM && \
+    ninja cxx cxxabi) || echo $step_result
+  local sanitizer_ldflags="-lc++abi -Wl,--rpath=${ROOT}/${libcxx_build_dir}/lib -L${ROOT}/${libcxx_build_dir}/lib"
+  local sanitizer_cflags="-nostdinc++ -isystem ${ROOT}/${libcxx_build_dir}/include -isystem ${ROOT}/${libcxx_build_dir}/include/c++/v1"
 
-  echo @@@BUILD_STEP build clang/$sanitizer_name@@@
+  echo @@@BUILD_STEP stage2/$sanitizer_name build@@@
 
   # See http://llvm.org/bugs/show_bug.cgi?id=19071, http://www.cmake.org/Bug/view.php?id=15264
   local cmake_bug_workaround_cflags="$sanitizer_ldflags $fsanitize_flag -w"
   sanitizer_cflags="$sanitizer_cflags $cmake_bug_workaround_cflags"
 
+  rm -rf ${build_dir}
   mkdir -p ${build_dir}
-  local extra_dir
-  if [ "$CHECK_LLD" != "0" ]; then
-    extra_dir="lld"
-  fi
-  local projects=clang
-  if [[ "$CHECK_LLD" != "0" ]]; then
-    projects="${projects};lld"
-  fi
-  local cmake_stage2_clang_options="-DLLVM_ENABLE_PROJECTS='${projects}'"
+  local cmake_stage2_clang_options="-DLLVM_ENABLE_PROJECTS='clang;lld;clang-tools-extra'"
   (cd ${build_dir} && \
    cmake \
      ${cmake_stage2_common_options} \
      ${cmake_stage2_clang_options} \
      -DCMAKE_BUILD_TYPE=${build_type} \
      -DLLVM_USE_SANITIZER=${llvm_use_sanitizer} \
-     ${cmake_libcxx_flag} \
+     -DLLVM_ENABLE_LIBCXX=ON \
      -DCMAKE_C_FLAGS="${sanitizer_cflags}" \
      -DCMAKE_CXX_FLAGS="${sanitizer_cflags}" \
      -DCMAKE_EXE_LINKER_FLAGS="${sanitizer_ldflags}" \
      $LLVM && \
-   ninja clang ${extra_dir}) || echo $step_result
+   ninja) || echo $step_result
 }
 
 function build_stage2_msan {
@@ -204,18 +210,8 @@ function check_stage2 {
   local step_result=$2
   local build_dir=${STAGE2_DIR}
   
-  echo @@@BUILD_STEP check-llvm ${sanitizer_name}@@@
-
-  (cd ${build_dir} && ninja check-llvm) || echo $step_result
-
-  echo @@@BUILD_STEP check-clang ${sanitizer_name}@@@
-
-  (cd ${build_dir} && ninja check-clang) || echo $step_result
-
-  if [ "$CHECK_LLD" != "0" ]; then
-    echo @@@BUILD_STEP check-lld ${sanitizer_name}@@@
-    (cd ${build_dir} && ninja check-lld) || echo $step_result
-  fi
+  echo @@@BUILD_STEP stage2/$sanitizer_name check@@@
+  ninja -C ${build_dir} check-all || echo $step_result
 }
 
 function check_stage2_msan {
@@ -236,12 +232,18 @@ function build_stage3 {
   local build_dir=llvm_build2_${sanitizer_name}
 
   local clang_path=$ROOT/${STAGE2_DIR}/bin
-  local cmake_stage3_options="${CMAKE_COMMON_OPTIONS} -DCMAKE_C_COMPILER=${clang_path}/clang -DCMAKE_CXX_COMPILER=${clang_path}/clang++"
-  cmake_stage3_options="${cmake_stage3_options} -DLLVM_ENABLE_PROJECTS='clang'"
-  
-  echo @@@BUILD_STEP build stage3/$sanitizer_name clang@@@
-  (mkdir -p ${build_dir} && cd ${build_dir} && cmake ${cmake_stage3_options} $LLVM && ninja clang) || \
-      echo $step_result
+  echo @@@BUILD_STEP build stage3/$sanitizer_name build@@@
+  rm -rf ${build_dir}
+  mkdir -p ${build_dir}
+  (cd ${build_dir} && \
+   cmake \
+     ${CMAKE_COMMON_OPTIONS} \
+     -DLLVM_ENABLE_PROJECTS='clang;lld,clang-tools-extra' \
+     -DCMAKE_C_COMPILER=${clang_path}/clang \
+     -DCMAKE_CXX_COMPILER=${clang_path}/clang++ \
+     -DLLVM_USE_LINKER=lld \
+     $LLVM && \
+  ninja clang) || echo $step_result
 }
 
 function build_stage3_msan {
@@ -261,11 +263,8 @@ function check_stage3 {
   local step_result=$2
   local build_dir=llvm_build2_${sanitizer_name}
 
-  echo @@@BUILD_STEP stage3/$sanitizer_name check-llvm@@@
-  (cd ${build_dir} && ninja check-llvm) || echo $step_result
-
-  echo @@@BUILD_STEP stage3/$sanitizer_name check-clang@@@
-  (cd ${build_dir} && ninja check-clang) || echo $step_result
+  echo @@@BUILD_STEP stage3/$sanitizer_name check@@@
+  (cd ${build_dir} && ninja check-all) || echo $step_result
 }
 
 function check_stage3_msan {

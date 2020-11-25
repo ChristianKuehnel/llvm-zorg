@@ -1,6 +1,6 @@
-from buildbot.steps.slave import RemoveDirectory
-from buildbot.process.properties import WithProperties, Property
-from buildbot.steps.shell import SetProperty
+from buildbot.plugins import steps, util
+from buildbot.steps.shell import SetPropertyFromCommand
+from buildbot.process.properties import WithProperties
 
 from zorg.buildbot.commands.CmakeCommand import CmakeCommand
 from zorg.buildbot.commands.NinjaCommand import NinjaCommand
@@ -36,9 +36,9 @@ def getLLVMBuildFactoryAndPrepareForSourcecodeSteps(
             **kwargs) # Pass through all the extra arguments.
 
     # Remove the source code for a clean checkout if requested by property.
-    # TODO: Some Windows slaves do not handle RemoveDirectory command well.
+    # TODO: Some Windows workers do not handle RemoveDirectory command well.
     # So, consider running "rmdir /S /Q <dir>" if the build runs on Windows.
-    f.addStep(RemoveDirectory(name='clean-src-dir',
+    f.addStep(steps.RemoveDirectory(name='clean-src-dir',
               dir=f.monorepo_dir,
               haltOnFailure=False,
               flunkOnFailure=False,
@@ -72,6 +72,7 @@ def addCmakeSteps(
            f,
            cleanBuildRequested,
            obj_dir,
+           generator=None,
            install_dir = None,
            extra_configure_args = None,
            env = None,
@@ -89,9 +90,9 @@ def addCmakeSteps(
 
     # This is an incremental build, unless otherwise has been requested.
     # Remove obj and install dirs for a clean build.
-    # TODO: Some Windows slaves do not handle RemoveDirectory command well.
+    # TODO: Some Windows workers do not handle RemoveDirectory command well.
     # So, consider running "rmdir /S /Q <dir>" if the build runs on Windows.
-    f.addStep(RemoveDirectory(name='clean-%s-dir' % obj_dir,
+    f.addStep(steps.RemoveDirectory(name='clean-%s-dir' % obj_dir,
               dir=obj_dir,
               haltOnFailure=False,
               flunkOnFailure=False,
@@ -110,7 +111,7 @@ def addCmakeSteps(
             ('-DCMAKE_INSTALL_PREFIX=', install_dir_rel),
             ])
 
-        f.addStep(RemoveDirectory(name='clean-%s-dir' % install_dir,
+        f.addStep(steps.RemoveDirectory(name='clean-%s-dir' % install_dir,
               dir=install_dir,
               haltOnFailure=False,
               flunkOnFailure=False,
@@ -136,15 +137,27 @@ def addCmakeSteps(
 
     src_dir = LLVMBuildFactory.pathRelativeTo(f.llvm_srcdir, obj_dir)
 
+    # Make a local copy of the configure args, as we are going to modify that.
+    definitions = dict()
+    options = list()
+    for d in  cmake_args:
+        if isinstance(d, str) and d.startswith("-D"):
+            k,v = d[2:].split('=', 1)
+            definitions[k] = v
+        else:
+            options.append(d)
+
     f.addStep(CmakeCommand(name=step_name,
-                           haltOnFailure=True,
-                           description=["Cmake", "configure", stage_name],
-                           options=cmake_args,
-                           path=src_dir,
-                           env=env,
-                           workdir=obj_dir,
-                           **kwargs # Pass through all the extra arguments.
-                           ))
+                          haltOnFailure=True,
+                          description=["Cmake", "configure", stage_name],
+                          generator=generator,
+                          definitions=definitions,
+                          options=options,
+                          path=src_dir,
+                          env=env or {},
+                          workdir=obj_dir,
+                          **kwargs # Pass through all the extra arguments.
+                          ))
 
 def addNinjaSteps(
            f,
@@ -156,26 +169,42 @@ def addNinjaSteps(
            stage_name = None,
            **kwargs):
 
-    # Build the unified tree.
-    if stage_name:
-        step_name = "%s-" % stage_name
-    else:
-        stage_name = ""
-        step_name = ""
-
     if obj_dir is None:
         obj_dir = f.obj_dir
 
-    f.addStep(NinjaCommand(name="build-%sunified-tree" % step_name,
+    if stage_name:
+        step_name = "{}-".format(stage_name)
+        step_description=["Build", stage_name]
+    else:
+        stage_name = ""
+        step_name = ""
+        step_description=["Build"]
+
+    if targets:
+        step_name = "build-{}{}".format(step_name, "-".join(targets))
+        step_description.extend(targets)
+    else:
+        step_name = "build-{}unified-tree".format(step_name)
+        step_description.extend(["unified", "tree"])
+
+    # Build the unified tree.
+    f.addStep(NinjaCommand(name=step_name,
                            haltOnFailure=True,
                            targets=targets,
-                           description=["Build", stage_name, "unified", "tree"],
-                           env=env,
+                           description=step_description,
+                           env=env or {},
                            workdir=obj_dir,
                            **kwargs # Pass through all the extra arguments.
                            ))
 
     # Test just built components if requested.
+    # Note: At this point env could be None, a dictionary, or a Property object.
+    if isinstance(env, dict):
+        check_env = env.copy() if env else dict()
+        check_env['NINJA_STATUS'] = check_env.get('NINJA_STATUS', "%e [%u/%r/%f] ")
+    else:
+        check_env = env or {}
+
     for check in checks:
         f.addStep(LitTestCommand(name="test-%s%s" % (step_name, check),
                                  command=['ninja', check],
@@ -183,7 +212,7 @@ def addNinjaSteps(
                                    "Test", "just", "built", "components", "for",
                                    check,
                                  ],
-                                 env=env,
+                                 env=check_env,
                                  workdir=obj_dir,
                                  **kwargs # Pass through all the extra arguments.
                                  ))
@@ -194,7 +223,7 @@ def addNinjaSteps(
         f.addStep(NinjaCommand(name="install-%sall" % step_name,
                                targets=["install"],
                                description=["Install", "just", "built", "components"],
-                               env=env,
+                               env=env or {},
                                workdir=obj_dir,
                                **kwargs # Pass through all the extra arguments.
                                ))
@@ -208,14 +237,6 @@ def getCmakeBuildFactory(
            extra_configure_args = None,
            env = None,
            **kwargs):
-
-    # Prepare environmental variables. Set here all env we want everywhere.
-    merged_env = {
-        'TERM' : 'dumb' # Be cautious and disable color output from all tools.
-    }
-    if env is not None:
-        # Overwrite pre-set items with the given ones, so user can set anything.
-        merged_env.update(env)
 
     f = getLLVMBuildFactoryAndSourcecodeSteps(
             depends_on_projects=depends_on_projects,
@@ -239,6 +260,7 @@ def getCmakeBuildFactory(
 
 def getCmakeWithNinjaBuildFactory(
            depends_on_projects = None,
+           targets = None,
            llvm_srcdir = None,
            obj_dir = None,
            checks = None,
@@ -257,6 +279,14 @@ def getCmakeWithNinjaBuildFactory(
     if checks is None:
         checks = ['check-all']
 
+    # Prepare environmental variables. Set here all env we want everywhere.
+    merged_env = {
+        'TERM' : 'dumb' # Be cautious and disable color output from all tools.
+    }
+    if env:
+        # Overwrite pre-set items with the given ones, so user can set anything.
+        merged_env.update(env)
+
     # Some options are required for this build no matter what.
     CmakeCommand.applyRequiredOptions(cmake_args, [
         ('-G',                      'Ninja'),
@@ -269,21 +299,23 @@ def getCmakeWithNinjaBuildFactory(
             install_dir=install_dir,
             clean=clean,
             extra_configure_args=cmake_args,
-            env=env,
+            env=merged_env,
             **kwargs) # Pass through all the extra arguments.
 
     addNinjaSteps(
            f,
            obj_dir=f.obj_dir,
+           targets=targets,
            checks=checks,
            install_dir=f.install_dir,
-           env=env,
+           env=merged_env,
            **kwargs)
 
     return f
 
 def getCmakeWithNinjaWithMSVCBuildFactory(
            depends_on_projects = None,
+           targets = None,
            llvm_srcdir = None,
            obj_dir = None,
            checks = None,
@@ -308,11 +340,6 @@ def getCmakeWithNinjaWithMSVCBuildFactory(
     if checks is None:
         checks = ['check-all']
 
-    # Set up VS environment, if appropriate.
-    if not vs:
-        # We build by Visual Studio 2015, unless otherwise is requested.
-        vs=r"""%VS140COMNTOOLS%"""
-
     f = getLLVMBuildFactoryAndSourcecodeSteps(
             depends_on_projects=depends_on_projects,
             llvm_srcdir=llvm_srcdir,
@@ -320,20 +347,16 @@ def getCmakeWithNinjaWithMSVCBuildFactory(
             install_dir=install_dir,
             **kwargs) # Pass through all the extra arguments.
 
-    f.addStep(SetProperty(
+    f.addStep(SetPropertyFromCommand(
         command=builders_util.getVisualStudioEnvironment(vs, target_arch),
-        extract_fn=builders_util.extractSlaveEnvironment))
-    env = Property('slave_env')
-
-    # Some options are required for this build no matter what.
-    CmakeCommand.applyRequiredOptions(cmake_args, [
-        ('-G',                      'Ninja'),
-        ])
+        extract_fn=builders_util.extractVSEnvironment))
+    env = util.Property('vs_env')
 
     cleanBuildRequested = lambda step: step.build.getProperty("clean", default=step.build.getProperty("clean_obj")) or clean
 
     addCmakeSteps(
         f,
+        generator='Ninja',
         cleanBuildRequested=cleanBuildRequested,
         obj_dir=f.obj_dir,
         install_dir=f.install_dir,
@@ -343,6 +366,7 @@ def getCmakeWithNinjaWithMSVCBuildFactory(
 
     addNinjaSteps(
            f,
+           targets=targets,
            obj_dir=obj_dir,
            checks=checks,
            install_dir=f.install_dir,
@@ -405,7 +429,7 @@ def getCmakeWithNinjaMultistageBuildFactory(
             llvm_srcdir=llvm_srcdir,
             obj_dir=obj_dir,
             install_dir=install_dir,
-            env=env,
+            env=merged_env,
             stage_objdirs=stage_objdirs,
             stage_installdirs=stage_installdirs,
             stage_names=stage_names,
@@ -429,11 +453,6 @@ def getCmakeWithNinjaMultistageBuildFactory(
             ('-DCLANG_BUILD_EXAMPLES=',    'OFF'),
             ])
 
-    # Some options are required for this build no matter what.
-    CmakeCommand.applyRequiredOptions(cmake_args, [
-        ('-G',                         'Ninja'),
-        ])
-
     # The stage 1 is special, though. We use the system compiler and
     # do incremental build, unless a clean one has been requested.
     cmake_args_stage1 = cmake_args[:]
@@ -446,11 +465,12 @@ def getCmakeWithNinjaMultistageBuildFactory(
 
     addCmakeSteps(
            f,
+           generator='Ninja',
            cleanBuildRequested=cleanBuildRequested,
            obj_dir=stage_objdirs[0],
            install_dir=stage_installdirs[0],
            extra_configure_args=cmake_args_stage1,
-           env=env,
+           env=merged_env,
            stage_name=stage_names[0],
            **kwargs)
 
@@ -459,7 +479,7 @@ def getCmakeWithNinjaMultistageBuildFactory(
            obj_dir=stage_objdirs[0],
            checks=checks,
            install_dir=stage_installdirs[0],
-           env=env,
+           env=merged_env,
            stage_name=stage_names[0],
            **kwargs)
 
@@ -490,21 +510,22 @@ def getCmakeWithNinjaMultistageBuildFactory(
             ('-DCMAKE_INSTALL_PREFIX=', install_dir),
             ])
         cmake_args_stageN.append(
-            WithProperties(
-                "-DCMAKE_CXX_COMPILER=%(workdir)s/" + staged_install + "/bin/clang++"
+            util.WithProperties(
+                "-DCMAKE_CXX_COMPILER=%(builddir)s/" + staged_install + "/bin/clang++"
             ))
         cmake_args_stageN.append(
-            WithProperties(
-                "-DCMAKE_C_COMPILER=%(workdir)s/" + staged_install + "/bin/clang"
+            util.WithProperties(
+                "-DCMAKE_C_COMPILER=%(builddir)s/" + staged_install + "/bin/clang"
             ))
 
         addCmakeSteps(
            f,
-           True, # We always do a clean build for the staged builds.
+           generator='Ninja',
+           cleanBuildRequested=True, # We always do a clean build for the staged builds.
            obj_dir=stage_objdirs[stage_idx],
            install_dir=stage_installdirs[stage_idx],
            extra_configure_args=cmake_args_stageN,
-           env=env,
+           env=merged_env,
            stage_name=stage_names[stage_idx],
            **kwargs)
 
@@ -513,7 +534,7 @@ def getCmakeWithNinjaMultistageBuildFactory(
            obj_dir=stage_objdirs[stage_idx],
            checks=checks,
            install_dir=stage_installdirs[stage_idx],
-           env=env,
+           env=merged_env,
            stage_name=stage_names[stage_idx],
            **kwargs)
 

@@ -1,12 +1,12 @@
 import re
-import urllib
 from os.path import basename
-import buildbot
-import buildbot.status.builder
-from buildbot.status.results import FAILURE, SUCCESS
-import buildbot.steps.shell
-from buildbot.process.buildstep import LogLineObserver
+
+from buildbot.process.results import SUCCESS
+from buildbot.process.results import FAILURE
+
 from buildbot.steps.shell import Test
+
+from buildbot.process.logobserver import LogLineObserver
 
 class LitLogObserver(LogLineObserver):
   # Regular expressions for a regular test line.
@@ -24,7 +24,7 @@ class LitLogObserver(LogLineObserver):
   kStartSummaryRE = re.compile(r'^Failing Tests \(\d*\)$')
 
   def __init__(self, maxLogs=None, parseSummaryOnly=False):
-    LogLineObserver.__init__(self)
+    super().__init__()
     self.resultCounts = {}
     self.maxLogs = maxLogs
     self.numLogs = 0
@@ -156,7 +156,7 @@ class LitTestCommand(Test):
 
   def __init__(self, ignore=[], flaky=[], max_logs=20, parseSummaryOnly=False,
                *args, **kwargs):
-    Test.__init__(self, *args, **kwargs)
+    super().__init__(*args, **kwargs)
     self.maxLogs = int(max_logs)
     self.logObserver = LitLogObserver(self.maxLogs, parseSummaryOnly)
     self.addFactoryArguments(max_logs=max_logs)
@@ -175,125 +175,10 @@ class LitTestCommand(Test):
     return SUCCESS
 
   def describe(self, done=False):
-    description = Test.describe(self, done)
-    for name, count in self.logObserver.resultCounts.iteritems():
+    description = Test.describe(self, done) or list()
+    for name, count in self.logObserver.resultCounts.items():
         if name in self.resultNames:
             description.append('{0} {1}'.format(count, self.resultNames[name]))
         else:
             description.append('Unexpected test result output ' + name)
     return description
-
-##
-
-import unittest
-
-class StepProxy(object):
-  def __init__(self):
-    self.logs = []
-
-  def addCompleteLog(self, name, text):
-    self.logs.append((name, text))
-
-class RemoteCommandProxy(object):
-  def __init__(self, rc):
-    self.rc = rc
-
-class TestLogObserver(unittest.TestCase):
-  def parse_log(self, text):
-    observer = LitLogObserver()
-    observer.step = StepProxy()
-    for ln in text.split('\n'):
-      observer.outLineReceived(ln)
-    return observer
-
-  def test_basic(self):
-    obs = self.parse_log("""
-PASS: test-one (1 of 4)
-FAIL: test-two (2 of 4)
-PASS: test-three (3 of 4)
-TIMEOUT: test-four (4 of 4)
-""")
-
-    self.assertEqual(obs.resultCounts, { 'FAIL' : 1, 'TIMEOUT' : 1, 'PASS' : 2 })
-    self.assertEqual(obs.step.logs, [('FAIL: test-two', 'FAIL: test-two'), ('TIMEOUT: test-four', 'TIMEOUT: test-four')])
-
-  def test_missing_lastresult(self):
-    obs = self.parse_log("""
-FAIL: LLDB :: 10-breakpoint-by-address-multiple-hit-first-add-next
-********** TEST 'LLDB :: 10-breakpoint-by-address-multiple-hit-first-add-next' FAIL **********
-bla bla bla
-**********
-         TIMEOUT: LLDB :: 57-dlopen-breakpoint (51 of 57)
-         ********** TEST 'LLDB :: 57-dlopen-breakpoint' TIMEOUT **********
-         bla
-         **********
-""")
-
-    self.assertEqual(obs.resultCounts, {'TIMEOUT': 1})
-
-  def test_verbose_logs(self):
-    obs = self.parse_log("""
-FAIL: test-one (1 of 3)
-FAIL: test-two (2 of 3)
-**** TEST 'test-two' FAILED ****
-bla bla bla
-**********
-FAIL: test-three (3 of 3)
-""")
-
-    self.assertEqual(obs.resultCounts, { 'FAIL' : 3 })
-    self.assertEqual(obs.step.logs, [
-        ('FAIL: test-one', 'FAIL: test-one'),
-        ('FAIL: test-two', """\
-**** TEST 'test-two' FAILED ****
-bla bla bla
-**********"""),
-        ('FAIL: test-three', 'FAIL: test-three')])
-
-  def test_indented_log(self):
-    obs = self.parse_log("""
-    FAIL: test-one (1 of 3)
-    FAIL: test-two (2 of 3)
-    **** TEST 'test-two' FAILED ****
-    bla bla bla
-    **********
-    FAIL: test-three (3 of 3)
-""")
-
-    self.assertEqual(obs.resultCounts, { 'FAIL' : 3 })
-    self.assertEqual(obs.step.logs, [
-        ('FAIL: test-one', 'FAIL: test-one'),
-        ('FAIL: test-two', """\
-    **** TEST 'test-two' FAILED ****
-    bla bla bla
-    **********"""),
-        ('FAIL: test-three', 'FAIL: test-three')])
-
-class TestCommand(unittest.TestCase):
-  def parse_log(self, text, **kwargs):
-    cmd = LitTestCommand(**kwargs)
-    cmd.logObserver.step = StepProxy()
-    for ln in text.split('\n'):
-      cmd.logObserver.outLineReceived(ln)
-    return cmd
-
-  def test_command_status(self):
-    # If the command failed, the status should always be error.
-    cmd = self.parse_log("")
-    self.assertEqual(cmd.evaluateCommand(RemoteCommandProxy(1)), FAILURE)
-
-    # If there were failing tests, the status should be an error (even if the
-    # test command didn't report as such).
-    for failing_code in set(['FAIL', 'XPASS', 'KPASS', 'UNRESOLVED', 'TIMEOUT']):
-      cmd = self.parse_log("""%s: test-one (1 of 1)""" % (failing_code,))
-      self.assertEqual(cmd.evaluateCommand(RemoteCommandProxy(0)), FAILURE)
-
-  def test_max_logs(self):
-    cmd = self.parse_log("""
-FAIL: test-one (1 of 2)
-FAIL: test-two (2 of 2)
-""", max_logs=1)
-    self.assertEqual(cmd.logObserver.step.logs, [('FAIL: test-one', 'FAIL: test-one')])
-
-if __name__ == '__main__':
-  unittest.main()

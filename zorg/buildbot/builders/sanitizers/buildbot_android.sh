@@ -13,19 +13,17 @@ PLATFORM=`uname`
 LOCAL_IPS=`hostname -I`
 export PATH="/usr/local/bin:$PATH"
 
-CHECK_LIBCXX=${CHECK_LIBCXX:-1}
-CHECK_LLD=${CHECK_LLD:-1}
 LLVM=$ROOT/llvm
 CMAKE_COMMON_OPTIONS="${CMAKE_COMMON_OPTIONS:-}"
-CMAKE_COMMON_OPTIONS="${CMAKE_COMMON_OPTIONS:-} -GNinja -DCMAKE_BUILD_TYPE=Release -DLLVM_PARALLEL_LINK_JOBS=20"
+CMAKE_COMMON_OPTIONS="${CMAKE_COMMON_OPTIONS:-} -GNinja -DCMAKE_BUILD_TYPE=Release"
 
 if [ -e /usr/include/plugin-api.h ]; then
-  CMAKE_COMMON_OPTIONS="${CMAKE_COMMON_OPTIONS} -DLLVM_BINUTILS_INCDIR=/usr/include"
+  CMAKE_COMMON_OPTIONS="${CMAKE_COMMON_OPTIONS}"
 fi
 
 clobber
 
-download_android_tools r16
+download_android_tools
 
 # Stage 1
 
@@ -37,13 +35,6 @@ buildbot_update
 CMAKE_COMMON_OPTIONS="$CMAKE_COMMON_OPTIONS -DLLVM_ENABLE_ASSERTIONS=ON"
 
 build_stage2_android
-
-# Android NDK has no iconv.h which is requred by LIBXML2.
-CMAKE_COMMON_OPTIONS="${CMAKE_COMMON_OPTIONS} -DLLVM_LIBXML2_ENABLED=OFF"
-
-build_android_ndk aarch64 arm64
-build_android_ndk arm arm
-build_android_ndk i686 x86
 
 echo @@@BUILD_STEP run cmake@@@
 configure_android aarch64 aarch64-linux-android
@@ -57,4 +48,4 @@ build_android arm
 build_android i686
 
 # Arm hardware is temporarily offline
-test_android i686:x86 # aarch64:arm64-v8a arm:armeabi-v7a
+test_android i686:x86 arm:armeabi-v7a aarch64:arm64-v8a

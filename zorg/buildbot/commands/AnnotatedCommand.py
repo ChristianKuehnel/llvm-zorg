@@ -1,421 +1,561 @@
-#!/usr/bin/python
-# Copyright (c) 2011 The Chromium Authors. All rights reserved.
-# Use of this source code is governed by a BSD-style license that can be
-# found in the LICENSE.chromium.TXT file.
+# pylint: disable=C0103
 
-import copy
+"""This class knows how to understand annotations.
+
+    Here are a list of the currently supported annotations:
+
+    @@@BUILD_STEP <stepname>@@@
+    Add a new step <stepname>. End the current step, marking with last available
+    status.
+
+    @@@STEP_LINK@<label>@<url>@@@
+    Add a link with label <label> linking to <url> to the current stage.
+
+    @@@STEP_WARNINGS@@@
+    Mark the current step as having warnings (oragnge).
+
+    @@@STEP_FAILURE@@@
+    Mark the current step as having failed (red).
+
+    @@@STEP_EXCEPTION@@@
+    Mark the current step as having exceptions (magenta).
+
+    @@@STEP_CLEAR@@@
+    Reset the text description of the current step.
+
+    @@@STEP_SUMMARY_CLEAR@@@
+    Reset the text summary of the current step.
+
+    @@@STEP_TEXT@<msg>@@@
+    Append <msg> to the current step text.
+
+    @@@STEP_SUMMARY_TEXT@<msg>@@@
+    Append <msg> to the step summary (appears on top of the waterfall).
+
+    @@@HALT_ON_FAILURE@@@
+    Halt if exception or failure steps are encountered (default is not).
+
+    @@@HONOR_ZERO_RETURN_CODE@@@
+    Honor the return code being zero (success), even if steps have other results.
+
+    Deprecated annotations:
+    TODO(bradnelson): drop these when all users have been tracked down.
+
+    @@@BUILD_WARNINGS@@@
+    Equivalent to @@@STEP_WARNINGS@@@
+
+    @@@BUILD_FAILED@@@
+    Equivalent to @@@STEP_FAILURE@@@
+
+    @@@BUILD_EXCEPTION@@@
+    Equivalent to @@@STEP_EXCEPTION@@@
+
+    @@@link@<label>@<url>@@@
+    Equivalent to @@@STEP_LINK@<label>@<url>@@@
+"""
+
 import re
-import time
 
+from twisted.internet import defer
+from twisted.internet import error
+from twisted.python import failure
+from twisted.python import log as logging
 
-from buildbot import util
 from buildbot.process import buildstep
-from buildbot.process.properties import WithProperties
-from buildbot.status import builder
-from buildbot.steps import shell
-from buildbot.steps import source
+from buildbot.process import results
+from buildbot.process import logobserver
+
+from buildbot.plugins import util
+
+from buildbot.util import asyncSleep
+from buildbot.util.misc import deferredLocked
+
+if False:  # for debugging
+    debuglog = logging.msg
+else:
+    debuglog = lambda m: None
+
+class AnnotatedBuildStep(buildstep.BuildStep):
+
+    def  __init__(self, parent_step, *args, **kwargs):
+        self.parent_step = parent_step
+        buildstep.BuildStep.__init__(self, *args, **kwargs)
+
+        # Step is really unpredictable
+        self.useProgress = False
+
+        self.build = self.parent_step.build
+        self.master = self.parent_step.build.master
+        self.worker = self.parent_step.worker
+
+        self.stdio_log = None
+
+        self._loglines = []
+        self._logLock = defer.DeferredLock()
+
+        self._request_finish = False
+
+    @defer.inlineCallbacks
+    def addStep(self):
+        debuglog("AnnotatedBuildStep: adding step '%s': buildid=%s" % (
+                    self.name, self.build.buildid))
+        yield buildstep.BuildStep.addStep(self)
+        # Put ourselves into a list of processed steps of the build object.
+        self.build.executedSteps.append(self)
+        # Init result to SUCCESS by default.
+        self.results = results.SUCCESS
+        self.description = [self.name]
+        self.stdio_log = yield self.addLog('stdio')
+
+        debuglog("AnnotatedBuildStep: added step '%s': stepid=%s, buildid=%s" % (
+                    self.name, self.stepid, self.build.buildid))
 
 
-class BuilderStatus(object):
-  # Order in asceding severity.
-  BUILD_STATUS_ORDERING = [
-      builder.SUCCESS,
-      builder.WARNINGS,
-      builder.FAILURE,
-      builder.EXCEPTION,
-  ]
+    @defer.inlineCallbacks
+    def finishStep(self):
+        hidden = False
+        debuglog("AnnotatedBuildStep: finish step '%s': stepid=%s, buildid=%s, results=%s" % (
+                    self.name, self.stepid, self.build.buildid, self.results))
+        yield self.master.data.updates.finishStep(self.stepid, self.results,
+                                                  hidden)
+        # finish unfinished logs
+        yield self.finishUnfinishedLogs()
 
-  @classmethod
-  def combine(cls, a, b):
-    """Combine two status, favoring the more severe."""
-    if a not in cls.BUILD_STATUS_ORDERING:
-      return b
-    if b not in cls.BUILD_STATUS_ORDERING:
-      return a
-    a_rank = cls.BUILD_STATUS_ORDERING.index(a)
-    b_rank = cls.BUILD_STATUS_ORDERING.index(b)
-    pick = max(a_rank, b_rank)
-    return cls.BUILD_STATUS_ORDERING[pick]
+    @defer.inlineCallbacks
+    def startStep(self, remote, done=False):
+        debuglog("AnnotatedBuildStep::startStep() starting '%s': "
+                 "buildid=%s, done=%s" % (
+                 self.name, self.build.buildid, done))
 
+        try:
+            yield self.addStep()
 
-class ProcessLogShellStep(shell.ShellCommand):
-  """ Step that can process log files.
+            try:
+                self.realUpdateSummary()
+                # The "main" step has finished already.
+                # Do only necessary work.
+                #NOTE: we can get 'request finish' flag before the step started.
+                self._request_finish = self._request_finish or done
+                self._running = True
+                self.results = yield self.run()
+            finally:
+                self._running = False
 
-    Delegates actual processing to log_processor, which is a subclass of
-    process_log.PerformanceLogParser.
+        except buildstep.BuildStepCancelled:
+            self.results = results.CANCELLED
 
-    Sample usage:
-    # construct class that will have no-arg constructor.
-    log_processor_class = chromium_utils.PartiallyInitialize(
-        process_log.GraphingPageCyclerLogProcessor,
-        report_link='http://host:8010/report.html,
-        output_dir='~/www')
-    # We are partially constructing Step because the step final
-    # initialization is done by BuildBot.
-    step = chromium_utils.PartiallyInitialize(
-        chromium_step.ProcessLogShellStep,
-        log_processor_class)
+        except buildstep.BuildStepFailed:
+            self.results = results.FAILURE
 
-  """
-  def  __init__(self, log_processor_class=None, *args, **kwargs):
-    """
-    Args:
-      log_processor_class: subclass of
-        process_log.PerformanceLogProcessor that will be initialized and
-        invoked once command was successfully completed.
-    """
-    self._result_text = []
-    self._log_processor = None
-    # If log_processor_class is not None, it should be a class.  Create an
-    # instance of it.
-    if log_processor_class:
-      self._log_processor = log_processor_class()
-    shell.ShellCommand.__init__(self, *args, **kwargs)
+        except error.ConnectionLost:
+            self.results = results.RETRY
 
-  def start(self):
-    """Overridden shell.ShellCommand.start method.
+        except Exception:
+            self.results = results.EXCEPTION
+            why = failure.Failure()
+            logging.err(why, "AnnotatedBuildStep.failed; traceback follows")
+            yield self.addLogWithFailure(why)
 
-    Adds a link for the activity that points to report ULR.
-    """
+        finally:
+            # update the summary one last time, make sure that completes,
+            # and then don't update it any more.
+            self.realUpdateSummary()
+            yield self.realUpdateSummary.stop()
 
-    # got_revision could be poisoned by checking out the script itself.
-    # So, let's assume that we will get the exactly the same revision
-    # this build has been triggered for, and let the script report
-    # the revision it checked out.
-    self.setProperty('got_revision', self.getProperty('revision'), 'Source')
+            # Update step status in the database.
+            yield self.finishStep()
 
-    self._CreateReportLinkIfNeccessary()
-    shell.ShellCommand.start(self)
+        debuglog("AnnotatedBuildStep::startStep() completed '%s': "
+                 "stepid=%s, buildid=%s, results=%s" % (
+                 self.name, self.stepid, self.build.buildid, self.results))
 
-  def _GetRevision(self):
-    """Returns the revision number for the build.
+    def requestFinish(self, status=None):
+        debuglog("AnnotatedBuildStep::requestFinish(%r): '%s': "
+                 "stepid=%s, buildid=%s, results=%r" % (
+                 status, self.name, self.stepid, self.build.buildid, self.results))
+        # Update the current step status with the worst result.
+        if status is not None:
+            self.updateStatus(status)
+        self._request_finish = True
 
-    Result is the revision number of the latest change that went in
-    while doing gclient sync. Tries 'got_revision' (from log parsing)
-    then tries 'revision' (usually from forced build). If neither are
-    found, will return -1 instead.
-    """
-    revision = None
-    try:
-      revision = self.build.getProperty('got_revision')
-    except KeyError:
-      pass  # 'got_revision' doesn't exist (yet)
-    if not revision:
-      try:
-        revision = self.build.getProperty('revision')
-      except KeyError:
-        pass  # neither exist
-    if not revision:
-      revision = -1
-    return revision
+    def setStepText(self, text=None):
+        if text is not None:
+            if self.description is not None:
+                self.description.append(text)
+        else:
+            self.description = []
 
-  def commandComplete(self, cmd):
-    """Callback implementation that will use log process to parse 'stdio' data.
-    """
-    if self._log_processor:
-      self._result_text = self._log_processor.Process(
-          self._GetRevision(), self.getLog('stdio').getText())
+        self.updateSummary()
 
-  def getText(self, cmd, results):
-    text_list = self.describe(True)
-    if self._result_text:
-      self._result_text.insert(0, '<div class="BuildResultInfo">')
-      self._result_text.append('</div>')
-      text_list = text_list + self._result_text
-    return text_list
+    def setStepSummary(self, text=None):
+        if text is not None:
+            if self.descriptionDone is not None:
+                self.descriptionDone.append(text)
+        else:
+            self.descriptionDone = []
 
-  def evaluateCommand(self, cmd):
-    shell_result = shell.ShellCommand.evaluateCommand(self, cmd)
-    log_result = None
-    if self._log_processor and 'evaluateCommand' in dir(self._log_processor):
-      log_result = self._log_processor.evaluateCommand(cmd)
-    return BuilderStatus.combine(shell_result, log_result)
+        self.updateSummary()
 
-  def _CreateReportLinkIfNeccessary(self):
-    if self._log_processor and self._log_processor.ReportLink():
-      self.addURL('results', "%s" % self._log_processor.ReportLink())
+    @deferredLocked("_logLock")
+    def _flushLogs(self):
+        if self._loglines:
+            ll = "".join(self._loglines)
+            self._loglines = []
+            self.stdio_log.addStdout(ll)
+        return defer.succeed(None)
 
+    @deferredLocked("_logLock")
+    def _addLogs(self, text):
+        if text is not None:
+            self._loglines.append(text)
+        return defer.succeed(None)
 
-class AnnotationObserver(buildstep.LogLineObserver):
-  """This class knows how to understand annotations.
+    @defer.inlineCallbacks
+    def run(self):
+        debuglog("AnnotatedBuildStep::run() starting '%s' step: "
+                 "stepid=%s, buildid=%s" % (
+                 self.name, self.stepid, self.build.buildid))
 
-  Here are a list of the currently supported annotations:
+        # Save previously collected log lines.
+        yield self._flushLogs()
 
-  @@@BUILD_STEP <stepname>@@@
-  Add a new step <stepname>. End the current step, marking with last available
-  status.
+        while not self._request_finish:
+            # Sleep for .1 second. Let arrive more logs.
+            yield asyncSleep(.1)
+            if self._loglines:
+                yield self._flushLogs()
 
-  @@@STEP_LINK@<label>@<url>@@@
-  Add a link with label <label> linking to <url> to the current stage.
+        # and the last one time.
+        if self._loglines:
+            yield self._flushLogs()
 
-  @@@STEP_WARNINGS@@@
-  Mark the current step as having warnings (oragnge).
+        debuglog("AnnotatedBuildStep::run() exiting '%s' step: "
+                 "stepid=%s, buildid=%s, results=%s" % (
+                 self.name, self.stepid, self.build.buildid, self.results))
 
-  @@@STEP_FAILURE@@@
-  Mark the current step as having failed (red).
+        return self.results
 
-  @@@STEP_EXCEPTION@@@
-  Mark the current step as having exceptions (magenta).
+    @defer.inlineCallbacks
+    def scheduleStdout(self, text):
+        if text is None:
+            return
 
-  @@@STEP_CLEAR@@@
-  Reset the text description of the current step.
+        # Not running yet, just store a log line.
+        if not self._running:
+            self._loglines.append(text)
+            return
 
-  @@@STEP_SUMMARY_CLEAR@@@
-  Reset the text summary of the current step.
+        # Already executed, add the log line with locking.
+        yield self._addLogs(text=text)
 
-  @@@STEP_TEXT@<msg>@@@
-  Append <msg> to the current step text.
-
-  @@@STEP_SUMMARY_TEXT@<msg>@@@
-  Append <msg> to the step summary (appears on top of the waterfall).
-
-  @@@HALT_ON_FAILURE@@@
-  Halt if exception or failure steps are encountered (default is not).
-
-  @@@HONOR_ZERO_RETURN_CODE@@@
-  Honor the return code being zero (success), even if steps have other results.
-
-  Deprecated annotations:
-  TODO(bradnelson): drop these when all users have been tracked down.
-
-  @@@BUILD_WARNINGS@@@
-  Equivalent to @@@STEP_WARNINGS@@@
-
-  @@@BUILD_FAILED@@@
-  Equivalent to @@@STEP_FAILURE@@@
-
-  @@@BUILD_EXCEPTION@@@
-  Equivalent to @@@STEP_EXCEPTION@@@
-
-  @@@link@<label>@<url>@@@
-  Equivalent to @@@STEP_LINK@<label>@<url>@@@
-  """
-
-  def __init__(self, command=None, *args, **kwargs):
-    buildstep.LogLineObserver.__init__(self, *args, **kwargs)
-    self.command = command
-    self.sections = []
-    self.annotate_status = builder.SUCCESS
-    self.halt_on_failure = False
-    self.honor_zero_return_code = False
-
-  def initialSection(self):
-    if self.sections:
-      return
-    # Add a log section for output before the first section heading.
-    log = self.command.addLog('preamble')
-    self.sections.append({
-        'name': 'preamble',
-        'step': self.command.step_status.getBuild().steps[-1],
-        'log': log,
-        'status': builder.SUCCESS,
-        'links': [],
-        'step_summary_text': [],
-        'step_text': [],
-    })
-
-  def fixupLast(self, status=None):
-    # Potentially start initial section here, as initial section might have
-    # no output at all.
-    self.initialSection()
-
-    last = self.sections[-1]
-    # Update status if set as an argument.
-    if status is not None:
-      last['status'] = status
-    # Final update of text.
-    self.updateText()
-    # Add timing info.
-    (start, end) = self.command.step_status.getTimes()
-    msg = '\n\n' + '-' * 80 + '\n'
-    if start is None:
-      msg += 'Not Started\n'
-    else:
-      if end is None:
-        end = util.now()
-      msg += '\n'.join([
-          'started: %s' % time.ctime(start),
-          'ended: %s' % time.ctime(end),
-          'duration: %s' % util.formatInterval(end - start),
-          '',  # So we get a final \n
-      ])
-    last['log'].addStdout(msg)
-    # Change status (unless handling the preamble).
-    if len(self.sections) != 1:
-      last['step'].stepFinished(last['status'])
-    # Finish log.
-    last['log'].finish()
-
-  def errLineReceived(self, line):
-    self.outLineReceived(line)
-
-  def updateStepStatus(self, status):
-    """Update current step status and annotation status based on a new event."""
-    self.annotate_status = BuilderStatus.combine(self.annotate_status, status)
-    last = self.sections[-1]
-    last['status'] = BuilderStatus.combine(last['status'], status)
-    if self.halt_on_failure and last['status'] in [
-        builder.FAILURE, builder.EXCEPTION]:
-      self.fixupLast()
-      self.command.finished(last['status'])
-
-  def updateText(self):
-    # Don't update the main phase's text.
-    if len(self.sections) == 1:
-      return
-
-    last = self.sections[-1]
-
-    # Reflect step status in text2.
-    if last['status'] == builder.EXCEPTION:
-      result = ['exception', last['name']]
-    elif last['status'] == builder.FAILURE:
-      result = ['failed', last['name']]
-    else:
-      result = []
-
-    last['step'].setText([last['name']] + last['step_text'])
-    last['step'].setText2(result + last['step_summary_text'])
-
-  def outLineReceived(self, line):
-    """This is called once with each line of the test log."""
-    # Add \n if not there, which seems to be the case for log lines from
-    # windows agents, but not others.
-    if not line.endswith('\n'):
-      line += '\n'
-    # Handle initial setup here, as step_status might not exist yet at init.
-    self.initialSection()
-    # Support: @@@STEP_LINK@<name>@<url>@@@ (emit link)
-    # Also support depreceated @@@link@<name>@<url>@@@
-    m = re.match('^@@@STEP_LINK@(.*)@(.*)@@@', line)
-    if not m:
-      m = re.match('^@@@link@(.*)@(.*)@@@', line)
-    if m:
-      link_label = m.group(1)
-      link_url = m.group(2)
-      self.sections[-1]['links'].append((link_label, link_url))
-      self.sections[-1]['step'].addURL(link_label, link_url)
-    # Support: @@@STEP_WARNINGS@@@ (warn on a stage)
-    # Also support deprecated @@@BUILD_WARNINGS@@@
-    if (line.startswith('@@@STEP_WARNINGS@@@') or
-        line.startswith('@@@BUILD_WARNINGS@@@')):
-      self.updateStepStatus(builder.WARNINGS)
-    # Support: @@@STEP_FAILURE@@@ (fail a stage)
-    # Also support deprecated @@@BUILD_FAILED@@@
-    if (line.startswith('@@@STEP_FAILURE@@@') or
-        line.startswith('@@@BUILD_FAILED@@@')):
-      self.updateStepStatus(builder.FAILURE)
-    # Support: @@@STEP_EXCEPTION@@@ (exception on a stage)
-    # Also support deprecated @@@BUILD_FAILED@@@
-    if (line.startswith('@@@STEP_EXCEPTION@@@') or
-        line.startswith('@@@BUILD_EXCEPTION@@@')):
-      self.updateStepStatus(builder.EXCEPTION)
-    # Support: @@@HALT_ON_FAILURE@@@ (halt if a step fails immediately)
-    if line.startswith('@@@HALT_ON_FAILURE@@@'):
-      self.halt_on_failure = True
-    # Support: @@@HONOR_ZERO_RETURN_CODE@@@ (succeed on 0 return, even if some
-    #     steps have failed)
-    if line.startswith('@@@HONOR_ZERO_RETURN_CODE@@@'):
-      self.honor_zero_return_code = True
-    # Support: @@@STEP_CLEAR@@@ (reset step description)
-    if line.startswith('@@@STEP_CLEAR@@@'):
-      self.sections[-1]['step_text'] = []
-      self.updateText()
-    # Support: @@@STEP_SUMMARY_CLEAR@@@ (reset step summary)
-    if line.startswith('@@@STEP_SUMMARY_CLEAR@@@'):
-      self.sections[-1]['step_summary_text'] = []
-      self.updateText()
-    # Support: @@@STEP_TEXT@<msg>@@@
-    m = re.match('^@@@STEP_TEXT@(.*)@@@', line)
-    if m:
-      self.sections[-1]['step_text'].append(m.group(1))
-      self.updateText()
-    # Support: @@@STEP_SUMMARY_TEXT@<msg>@@@
-    m = re.match('^@@@STEP_SUMMARY_TEXT@(.*)@@@', line)
-    if m:
-      self.sections[-1]['step_summary_text'].append(m.group(1))
-      self.updateText()
-    # Support: @@@BUILD_STEP <step_name>@@@ (start a new section)
-    m = re.match('^@@@BUILD_STEP (.*)@@@', line)
-    if m:
-      step_name = m.group(1)
-      # Ignore duplicate consecutive step labels (for robustness).
-      if step_name != self.sections[-1]['name']:
-        # Finish up last section.
-        self.fixupLast()
-        # Add new one.
-        step = self.command.step_status.getBuild().addStepWithName(step_name)
-        step.stepStarted()
-        step.setText([step_name])
-        log = step.addLog('stdio')
-        self.sections.append({
-            'name': step_name,
-            'step': step,
-            'log': log,
-            'status': builder.SUCCESS,
-            'links': [],
-            'step_summary_text': [],
-            'step_text': [],
-        })
-    # Add to the current secondary log.
-    # Doing this last so that @@@BUILD_STEP... occurs in the log of the new
-    # step.
-    self.sections[-1]['log'].addStdout(line)
-
-  def handleReturnCode(self, return_code):
-    # Treat all non-zero return codes as failure.
-    # We could have a special return code for warnings/exceptions, however,
-    # this might conflict with some existing use of a return code.
-    # Besides, applications can always intercept return codes and emit
-    # STEP_* tags.
-    if return_code == 0:
-      self.fixupLast()
-      if self.honor_zero_return_code:
-        self.annotate_status = builder.SUCCESS
-    else:
-      self.annotate_status = builder.FAILURE
-      self.fixupLast(builder.FAILURE)
+    def updateStatus(self, status):
+        self.results = results.worst_status(self.results, status)
 
 
-class AnnotatedCommand(ProcessLogShellStep):
-  """Buildbot command that knows how to display annotations."""
+ALL_COMMANDS = list(range(11))
+STEP_LINK, STEP_WARNINGS, STEP_FAILURE, STEP_EXCEPTION, HALT_ON_FAILURE, HONOR_ZERO_RC, STEP_CLEAR, STEP_SUMMARY_CLEAR, STEP_TEXT, STEP_SUMMARY_TEXT, BUILD_STEP = ALL_COMMANDS
 
-  def __init__(self, *args, **kwargs):
-    # Inject standard tags into the environment.
-    env = {
-        'BUILDBOT_BLAMELIST': WithProperties('%(blamelist:-[])s'),
-        'BUILDBOT_BRANCH': WithProperties('%(branch:-None)s'),
-        'BUILDBOT_BUILDERNAME': WithProperties('%(buildername:-None)s'),
-        'BUILDBOT_BUILDNUMBER': WithProperties('%(buildnumber:-None)s'),
-        'BUILDBOT_CLOBBER': WithProperties('%(clobber:+1)s'),
-        'BUILDBOT_GOT_REVISION': WithProperties('%(got_revision:-None)s'),
-        'BUILDBOT_REVISION': WithProperties('%(revision:-None)s'),
-        'BUILDBOT_SCHEDULER': WithProperties('%(scheduler:-None)s'),
-        'BUILDBOT_SLAVENAME': WithProperties('%(slavename:-None)s'),
-        'BUILDBOT_MSAN_ORIGINS': WithProperties('%(msan_origins:-)s'),
-    }
-    # Apply the passed in environment on top.
-    old_env = kwargs.get('env')
-    if not old_env:
-      old_env = {}
-    env.update(old_env)
-    # Change passed in args (ok as a copy is made internally).
-    kwargs['env'] = env
+class AnnotatedCommand(buildstep.ShellMixin, buildstep.BuildStep):
+    """Buildbot command that knows how to display annotations."""
 
-    ProcessLogShellStep.__init__(self, *args, **kwargs)
-    self.script_observer = AnnotationObserver(self)
-    self.addLogObserver('stdio', self.script_observer)
+    _re_step_link           = re.compile(r'^@@@(STEP_LINK|link)@(?P<link_label>.*)@(?P<link_url>.*)@@@', re.M)
+    _re_step_warnings       = re.compile(r'^@@@(STEP_WARNINGS|BUILD_WARNINGS)@@@', re.M)
+    _re_step_failure        = re.compile(r'^@@@(STEP_FAILURE|BUILD_FAILED)@@@', re.M)
+    _re_step_exception      = re.compile(r'^@@@(STEP_EXCEPTION|BUILD_EXCEPTION)@@@', re.M)
+    _re_halt_on_failure     = re.compile(r'^@@@HALT_ON_FAILURE@@@', re.M)
+    _re_honor_zero_rc       = re.compile(r'^@@@HONOR_ZERO_RETURN_CODE@@@', re.M)
+    _re_step_clear          = re.compile(r'^@@@STEP_CLEAR@@@', re.M)
+    _re_step_summary_clear  = re.compile(r'^@@@STEP_SUMMARY_CLEAR@@@', re.M)
+    _re_step_text           = re.compile(r'^@@@STEP_TEXT@(?P<text>.*)@@@', re.M)
+    _re_step_summary_step   = re.compile(r'^@@@STEP_SUMMARY_TEXT@(?P<text>.*)@@@', re.M)
+    _re_build_step          = re.compile(r'^@@@BUILD_STEP (?P<name>.*)@@@', re.M)
 
-  def interrupt(self, reason):
-    self.script_observer.fixupLast(builder.EXCEPTION)
-    return ProcessLogShellStep.interrupt(self, reason)
+    _re_set = [
+        # Support: @@@STEP_LINK@<name>@<url>@@@ (emit link)
+        # Also support depreceated @@@link@<name>@<url>@@@
+        ( STEP_LINK,            _re_step_link),
 
-  def evaluateCommand(self, cmd):
-    observer_result = self.script_observer.annotate_status
-    # Check if ProcessLogShellStep detected a failure or warning also.
-    log_processor_result = ProcessLogShellStep.evaluateCommand(self, cmd)
-    return BuilderStatus.combine(observer_result, log_processor_result)
+        # Support: @@@STEP_WARNINGS@@@ (warn on a stage)
+        # Also support deprecated @@@BUILD_WARNINGS@@@
+        ( STEP_WARNINGS,        _re_step_warnings ),
 
-  def commandComplete(self, cmd):
-    self.script_observer.handleReturnCode(cmd.rc)
-    return ProcessLogShellStep.commandComplete(self, cmd)
+        # Support: @@@STEP_FAILURE@@@ (fail a stage)
+        # Also support deprecated @@@BUILD_FAILED@@@
+        ( STEP_FAILURE,         _re_step_failure ),
+
+        # Support: @@@STEP_EXCEPTION@@@ (exception on a stage)
+        # Also support deprecated @@@BUILD_FAILED@@@
+        ( STEP_EXCEPTION,       _re_step_exception ),
+
+        # Support: @@@HALT_ON_FAILURE@@@ (halt if a step fails immediately)
+        ( HALT_ON_FAILURE,      _re_halt_on_failure ),
+
+        # Support: @@@HONOR_ZERO_RETURN_CODE@@@ (succeed on 0 return, even if some
+        # steps have failed)
+        ( HONOR_ZERO_RC,        _re_honor_zero_rc ),
+
+        # Support: @@@STEP_CLEAR@@@ (reset step description)
+        ( STEP_CLEAR,           _re_step_clear ),
+
+        # Support: @@@STEP_SUMMARY_CLEAR@@@ (reset step summary)
+        ( STEP_SUMMARY_CLEAR,   _re_step_summary_clear ),
+
+        # Support: @@@STEP_TEXT@<msg>@@@
+        ( STEP_TEXT,            _re_step_text ),
+
+        # Support: @@@STEP_SUMMARY_TEXT@<msg>@@@
+        ( STEP_SUMMARY_TEXT,    _re_step_summary_step ),
+
+        # Support: @@@BUILD_STEP <step_name>@@@ (start a new section)
+        ( BUILD_STEP,           _re_build_step ),
+    ]
+
+    def __init__(self, **kwargs):
+        # Inject standard tags into the environment.
+        env = {
+            'BUILDBOT_BLAMELIST':       util.Interpolate('%(prop:blamelist:-[])s'),
+            'BUILDBOT_BRANCH':          util.Interpolate('%(prop:branch:-None)s'),
+            'BUILDBOT_BUILDERNAME':     util.Interpolate('%(prop:buildername:-None)s'),
+            'BUILDBOT_BUILDNUMBER':     util.Interpolate('%(prop:buildnumber:-None)s'),
+            'BUILDBOT_CLOBBER':         util.Interpolate('%(prop:clobber:+1)s'),
+            'BUILDBOT_GOT_REVISION':    util.Interpolate('%(prop:got_revision:-None)s'),
+            'BUILDBOT_REVISION':        util.Interpolate('%(prop:revision:-None)s'),
+            'BUILDBOT_SCHEDULER':       util.Interpolate('%(prop:scheduler:-None)s'),
+            'BUILDBOT_SLAVENAME':       util.Interpolate('%(prop:slavename:-None)s'),
+            'BUILDBOT_MSAN_ORIGINS':    util.Interpolate('%(prop:msan_origins:-)s'),
+        }
+        # Apply the passed in environment on top.
+        old_env = kwargs.get('env') or {}
+        env.update(old_env)
+        # Change passed in args (ok as a copy is made internally).
+        kwargs['env'] = env
+
+        kwargs = self.setupShellMixin(kwargs)
+        super().__init__(**kwargs)
+
+        self.addLogObserver('stdio', logobserver.LineConsumerLogObserver(self.processAnnotations))
+        # A step log to store all logs, which we got before the first @@@BUILD_STEP @@@ command.
+        self.preamble_log = None
+
+        self.annotate_status = results.SUCCESS
+        self.halt_on_failure = False
+        self.honor_zero_return_code = False
+
+        self.annotated_steps = []
+        # Use this lock to "run" the annotated steps.
+        self.initLock = defer.DeferredLock()
+        self._annotated_finished = False
+
+    def _getLastAnnotatedStep(self):
+        return self.annotated_steps[-1] if self.annotated_steps else None
+
+    def _updateLastAnnotatedStepStatus(self, status):
+        debuglog(">>> AnnotatedCommand::_updateLastAnnotatedStepStatus(%r)" % status)
+
+        # Alway update the common annotate command status.
+        self.annotate_status = results.worst_status(self.annotate_status, status)
+
+        s = self._getLastAnnotatedStep()
+        if s is not None:
+            s.updateStatus(status)
+
+        if self.halt_on_failure and status in [results.FAILURE, results.EXCEPTION]:
+            if self.cmd:
+                self.cmd.interrupt("Failed annotated step")
+
+    def _updateLastAnnotatedStepText(self, text = None):
+        """Updating a step text. None to clean up."""
+        debuglog(">>> AnnotatedCommand::_updateLastAnnotatedStepText('%s')" % (text if text else ''))
+
+        s = self._getLastAnnotatedStep()
+        if s is not None:
+            s.setStepText(text)
+
+    def _updateLastAnnotatedStepSummaryInfo(self, text = None):
+        """Updating a step summary info. None to clean up."""
+        debuglog(">>> AnnotatedCommand::_updateLastAnnotatedStepSummaryInfo('%s')" % (text if text else ''))
+
+        s = self._getLastAnnotatedStep()
+        if s is not None:
+            s.setStepSummary(text)
+
+    def _fixupActiveAnnotatedStep(self):
+        debuglog(">>> AnnotatedCommand::_fixupActiveAnnotatedStep()")
+        # Fixup the active step
+        s = self._getLastAnnotatedStep()
+        if s is not None:
+            # Finish the active step with its current status.
+            s.requestFinish()
+
+    def _scheduleNewAnnotatedStep(self, name, logline):
+        debuglog(">>> AnnotatedCommand::_scheduleNewAnnotatedStep('%s')" % name)
+
+        self._fixupActiveAnnotatedStep()
+
+        s = AnnotatedBuildStep(parent_step=self, name=name)
+        # Doing this last so that @@@BUILD_STEP... occurs in the log of the new
+        # step.
+        s.scheduleStdout(logline)
+        # Make it ready to consume the logs and status updates.
+        self.annotated_steps.append(s)
+
+
+    @deferredLocked("initLock")
+    @defer.inlineCallbacks
+    def _execStep(self, step, done):
+        yield step.startStep(remote=None, done=done)
+
+    @defer.inlineCallbacks
+    def _walkOverScheduledAnnotatedSteps(self):
+        debuglog(">>> AnnotatedCommand::_walkOverScheduledAnnotatedSteps: started")
+
+        while self.annotated_steps or not self._annotated_finished:
+            if self.annotated_steps:
+                yield self._execStep(self.annotated_steps[0], done=self._annotated_finished)
+                last_step = self.annotated_steps.pop(0)
+                if last_step.results == results.EXCEPTION:
+                    raise Exception("Annotated step exception")
+
+            if not self._annotated_finished:
+                yield asyncSleep(.1)
+
+        debuglog(">>> AnnotatedCommand::_walkOverScheduledAnnotatedSteps: finished")
+
+    def run(self):
+        return self.runAnnotatedCommands()
+
+    @defer.inlineCallbacks
+    def runAnnotatedCommands(self):
+        try:
+            # Create a preamble log for primary annotate step.
+            self.preamble_log = yield self.addLog('preamble')
+
+            cmd = yield self.makeRemoteShellCommand(command=self.command,
+                                                    stdioLogName='stdio')
+
+            d1 = self.runCommand(cmd)
+            d2 = defer.maybeDeferred(self._walkOverScheduledAnnotatedSteps)
+
+            @d1.addBoth
+            def cb(r):
+                self._annotated_finished = True
+                try:
+                    # In some cases we can get the empty queue after the check.
+                    # Just catch and pass the exception.
+                    if self.annotated_steps:
+                        # Current processing step.
+                        last_step = self.annotated_steps[0]
+                        cmd_results = cmd.results()
+                        # We can get CANCELLED for two cases:
+                        # 1. when UI stop button was pressed. In that case just pass this status
+                        #    into the annotated step as the result status.
+                        # 2. and when the remote command was canceled because of failed annotated step.
+                        #    For that situation we finish the annotated step with its current status.
+                        if cmd_results == results.CANCELLED and last_step.results in [results.FAILURE, results.EXCEPTION]:
+                            # Finish the annotated step with its current status.
+                            last_step.requestFinish()
+                        else:
+                            last_step.requestFinish(cmd_results)
+                except IndexError:
+                    pass
+                return r
+
+            @d2.addErrback
+            def cbErrback(r):
+                debuglog("+++ AnnotatedCommand::runAnnotatedCommands(): error callback with exception. "
+                         "Terminate remote command.")
+                self.annotate_status = results.EXCEPTION
+                if self.cmd:
+                    self.cmd.interrupt("Annotated step exception")
+                return r
+
+            # Wait until both -- the remote command and the annotated step processing loop -- get finished.
+            yield defer.DeferredList([d1, d2])
+
+        except Exception:
+            why = failure.Failure()
+            logging.err(why, "AnnotatedCommand.failed; traceback follows")
+            yield self.addLogWithFailure(why)
+
+        # This case when the remote command has been canceled by failed annotated command.
+        if cmd.results() == results.CANCELLED and self.annotate_status in [results.FAILURE, results.EXCEPTION]:
+            return self.annotate_status
+        # Regular case.
+        return results.worst_status(cmd.results(), self.annotate_status)
+
+    def processAnnotations(self):
+
+        while True:
+            try:
+                stream, ln = yield
+                # Add \n if not there, which seems to be the case for log lines from
+                # windows agents, but not others.
+                if not ln.endswith('\n'):
+                    ln += '\n'
+
+                self.processAnnotatedCommand(ln)
+            except GeneratorExit:
+                return
+
+    def processAnnotatedCommand(self, line):
+        #pylint: disable=too-many-branches
+
+        # returns: op, args
+        def parse_annotate_cmd(ln):
+            for ancmd, anre in AnnotatedCommand._re_set:
+                ro = anre.search(ln)
+                if ro is not None:
+                    # Get the regex named group values.
+                    # We can get the empty set, but it is ok.
+                    args = ro.groupdict() or {}
+                    # Store the current log line within the arguments.
+                    # We will need to save it in some cases.
+                    args['logline'] = ln
+                    return ancmd, args
+            return None, None
+
+        ancmd, args = parse_annotate_cmd(line)
+
+        if ancmd:
+            debuglog(">>> AnnotatedCommand::processAnnotatedCommand(): %s, %r" % (ancmd, args))
+
+        try:
+            if ancmd == STEP_LINK:
+                s = self._getLastAnnotatedStep()
+                if s is not None:
+                    s.addURL(args['link_label'], args['link_url'])
+                else:
+                    logging.msg("Warning: missed link for annotated step. "
+                                "No active steps. (%s/%s)" % (args['link_label'], args['link_url']))
+
+            elif ancmd == STEP_WARNINGS:
+                self._updateLastAnnotatedStepStatus(results.WARNINGS)
+            elif ancmd == STEP_FAILURE:
+                self._updateLastAnnotatedStepStatus(results.FAILURE)
+            elif ancmd == STEP_EXCEPTION:
+                self._updateLastAnnotatedStepStatus(results.EXCEPTION)
+            elif ancmd == HALT_ON_FAILURE:
+                self.halt_on_failure = True
+            elif ancmd == HONOR_ZERO_RC:
+                self.honor_zero_return_code = True
+            elif ancmd == STEP_CLEAR:
+                self._updateLastAnnotatedStepText()
+            elif ancmd == STEP_SUMMARY_CLEAR:
+                self._updateLastAnnotatedStepSummaryInfo()
+            elif ancmd == STEP_TEXT:
+                self._updateLastAnnotatedStepText(text=args['text'])
+            elif ancmd == STEP_SUMMARY_TEXT:
+                self._updateLastAnnotatedStepSummaryInfo(text=args['text'])
+            elif ancmd == BUILD_STEP:
+                self._scheduleNewAnnotatedStep(name=args['name'].strip(),
+                                               logline=args['logline'])
+            else:
+                # Regular log line, forward it to the active step.
+                s = self._getLastAnnotatedStep()
+                if s is None and self.preamble_log is not None:
+                    self.preamble_log.addStdout(line)
+                else:
+                    s.scheduleStdout(line)
+
+        except Exception:
+            logging.err(failure.Failure(), 'error while processing annotgated command log:')
